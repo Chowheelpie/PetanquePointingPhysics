@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>法式滾球拋物線解析工具 - Petanque Physics</title>
+    
+    <!-- 引入 Tailwind CSS (負責排版與樣式) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- 引入 React 核心函式庫 -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    
+    <!-- 引入 Babel (負責在瀏覽器中編譯 JSX 語法) -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <style>
+        body { margin: 0; padding: 0; background-color: #f1f5f9; }
+        /* 隱藏滾動條以獲得更好的 App 體驗 */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f5f9; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        const App = () => {
+          // 物理常數
+          const [gravity] = useState(9.81);
+          const [baseFriction] = useState(2.2); // 基礎摩擦力
+          const canvasRef = useRef(null);
+          const groundY = 320; 
+          const startX = 60;   
+          const scale = 60;    
+
+          // 狀態：仰角、力道、後旋轉
+          const [angle, setAngle] = useState(45.0);
+          const [power, setPower] = useState(45.0);
+          const [spin, setSpin] = useState(400); // 預設轉速 400 RPM
+          const [ghostPath, setGhostPath] = useState(null);
+          
+          // 動畫相關狀態
+          const [isAnimating, setIsAnimating] = useState(false);
+          const [ballState, setBallState] = useState({ x: startX, y: groundY, vx: 0, vy: 0, rolling: false });
+          const [trail, setTrail] = useState([]);
+          
+          // 拖拽狀態
+          const [isDraggingApex, setIsDraggingApex] = useState(false);
+          const [isDraggingLanding, setIsDraggingLanding] = useState(false);
+          const [canvasCursor, setCanvasCursor] = useState('default');
+
+          // --- 核心物理運算：統一預測與動畫邏輯 ---
+          const currentResult = useMemo(() => {
+            const rad = (angle * Math.PI) / 180;
+            const v0 = power * 0.18; 
+            const vx0 = v0 * Math.cos(rad);
+            const vy0 = -v0 * Math.sin(rad); 
+
+            // 1. 飛行階段：計算落點
+            const tLand = (2 * Math.abs(vy0)) / gravity;
+            const landingDist = vx0 * tLand;
+            const landingX = startX + landingDist * scale;
+
+            // 2. 滾動階段：計算滾動距離
+            // 平滑的彈跳保留邏輯
+            const bounceFactor = 0.5 + 0.5 * Math.cos(rad);
+            let vxLanding = vx0 * bounceFactor; 
+            
+            // 後旋轉煞車效應 (修正為落地瞬間的動能抵銷 Impulse)
+            // 結合仰角：仰角越高(sin越大)，垂直撞擊越重，咬地煞車效果越強；低仰角則會滑過地面
+            const spinEffect = (spin - 400) / 800; // 0 ~ 1
+            const spinBrakeVelocity = spinEffect * 1.2 * Math.sin(rad); // 最大抵銷 1.2 m/s 的水平速度
+            
+            // 落地後的水平速度被後旋轉抵銷
+            vxLanding = Math.max(0, vxLanding - spinBrakeVelocity);
+
+            // 恢復基礎摩擦力，不再持續改變摩擦係數
+            const dynamicFriction = baseFriction; 
+            
+            // 根據公式 v^2 = 2as -> s = v^2 / 2a
+            const rollDist = (vxLanding * vxLanding) / (2 * dynamicFriction);
+            const finalX = landingX + rollDist * scale;
+
+            // 3. 頂點座標 (Apex)
+            const hMax = (vy0 * vy0) / (2 * gravity);
+            const apexX = startX + (vx0 * tLand / 2) * scale;
+            const apexY = groundY - hMax * scale;
+
+            // 4. 生成路徑點 (用於預覽虛線)
+            let flightPoints = [];
+            for (let t = 0; t <= tLand; t += 0.02) {
+              flightPoints.push({
+                x: startX + vx0 * t * scale,
+                y: groundY + (vy0 * t + 0.5 * gravity * t * t) * scale
+              });
+            }
+
+            return { flightPoints, landingX, finalX, apexX, apexY, vx0, vy0, v0, rad, landingDist, hMax, dynamicFriction };
+          }, [angle, power, spin, gravity, baseFriction]);
+
+          // --- 逆向物理：根據 H 和 L 反推 Angle/Power ---
+          const updateFromHandles = (newL, newH) => {
+            const L = Math.max(0.5, newL);
+            const H = Math.max(0.1, newH);
+            
+            // v0y = sqrt(2 * g * H)
+            const v0y = Math.sqrt(2 * gravity * H);
+            // t_land = 2 * v0y / g
+            const tLand = (2 * v0y) / gravity;
+            // v0x = L / t_land
+            const v0x = L / tLand;
+
+            const v0 = Math.sqrt(v0x * v0x + v0y * v0y);
+            const newAngle = Math.atan2(v0y, v0x) * (180 / Math.PI);
+            const newPower = v0 / 0.18;
+
+            if (!isNaN(newAngle) && !isNaN(newPower)) {
+              setAngle(Math.min(88, Math.max(10, newAngle)));
+              setPower(Math.min(100, Math.max(5, newPower)));
+            }
+          };
+
+          // --- 真實物理動畫循環 ---
+          useEffect(() => {
+            if (!isAnimating) return;
+
+            let requestID;
+            let lastTime = performance.now();
+            
+            let state = {
+              x: startX,
+              y: groundY - 5,
+              vx: currentResult.vx0 * scale,
+              vy: currentResult.vy0 * scale,
+              rolling: false
+            };
+            
+            setTrail([]);
+
+            const animate = (time) => {
+              const dt = (time - lastTime) / 1000;
+              lastTime = time;
+
+              if (dt > 0.1) {
+                requestID = requestAnimationFrame(animate);
+                return;
+              }
+
+              if (!state.rolling) {
+                state.x += state.vx * dt;
+                state.y += state.vy * dt;
+                state.vy += gravity * scale * dt;
+
+                if (state.y >= groundY - 5 && state.vy > 0) {
+                  state.y = groundY - 5;
+                  state.rolling = true;
+                  // 落地水平速度損耗
+                  const rad = (angle * Math.PI) / 180;
+                  const bounceFactor = 0.5 + 0.5 * Math.cos(rad);
+                  let vxLanding = state.vx * bounceFactor;
+                  
+                  // 動畫套用：後旋轉咬地煞車
+                  const spinEffect = (spin - 400) / 800;
+                  const spinBrakeVelocity = spinEffect * 1.2 * Math.sin(rad) * scale;
+                  state.vx = Math.max(0, vxLanding - spinBrakeVelocity);
+                }
+              } else {
+                // 線性減速 (恢復基礎摩擦力)
+                const decel = currentResult.dynamicFriction * scale;
+                if (Math.abs(state.vx) > 2) {
+                  state.x += state.vx * dt;
+                  const drag = Math.sign(state.vx) * decel * dt;
+                  state.vx -= drag;
+                } else {
+                  state.vx = 0;
+                  setIsAnimating(false);
+                }
+              }
+
+              setBallState({ ...state });
+              setTrail(prev => [...prev.slice(-50), { x: state.x, y: state.y }]);
+              requestID = requestAnimationFrame(animate);
+            };
+
+            requestID = requestAnimationFrame(animate);
+            return () => cancelAnimationFrame(requestID);
+          }, [isAnimating, currentResult, gravity, angle]);
+
+          // --- 滑鼠互動處理 ---
+          const getMousePos = (e) => {
+            const rect = canvasRef.current.getBoundingClientRect();
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+            return {
+              x: (clientX - rect.left) * (canvasRef.current.width / rect.width),
+              y: (clientY - rect.top) * (canvasRef.current.height / rect.height)
+            };
+          };
+
+          const handleStart = (e) => {
+            if (isAnimating) return;
+            const pos = getMousePos(e);
+            const distApex = Math.sqrt(Math.pow(pos.x - currentResult.apexX, 2) + Math.pow(pos.y - currentResult.apexY, 2));
+            if (distApex < 30) { setIsDraggingApex(true); return; }
+            const distLanding = Math.sqrt(Math.pow(pos.x - currentResult.landingX, 2) + Math.pow(pos.y - groundY, 2));
+            if (distLanding < 30) { setIsDraggingLanding(true); return; }
+          };
+
+          const handleMove = (e) => {
+            const pos = getMousePos(e);
+            
+            if (!isDraggingApex && !isDraggingLanding) {
+              const distApex = Math.sqrt(Math.pow(pos.x - currentResult.apexX, 2) + Math.pow(pos.y - currentResult.apexY, 2));
+              const distLanding = Math.sqrt(Math.pow(pos.x - currentResult.landingX, 2) + Math.pow(pos.y - groundY, 2));
+              setCanvasCursor(distApex < 30 || distLanding < 30 ? 'pointer' : 'default');
+              return;
+            }
+
+            if (isDraggingApex) {
+              const targetL = (currentResult.landingX - startX) / scale;
+              const targetH = Math.max(0.1, (groundY - pos.y) / scale);
+              updateFromHandles(targetL, targetH);
+            } else if (isDraggingLanding) {
+              const targetH = (groundY - currentResult.apexY) / scale;
+              const targetL = Math.max(0.5, (pos.x - startX) / scale);
+              updateFromHandles(targetL, targetH);
+            }
+          };
+
+          const handleEnd = () => {
+            setIsDraggingApex(false);
+            setIsDraggingLanding(false);
+          };
+
+          // --- 畫布繪製 ---
+          useEffect(() => {
+            const canvas = canvasRef.current;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // 1. 環境繪製
+            ctx.fillStyle = 'rgba(234, 179, 8, 0.05)';
+            ctx.fillRect(startX + 6 * scale, 0, 4 * scale, groundY);
+            ctx.beginPath();
+            ctx.moveTo(0, groundY);
+            ctx.lineTo(canvas.width, groundY);
+            ctx.strokeStyle = '#64748b';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            for(let i=0; i <= 12; i++) {
+              const xPos = startX + i * scale;
+              ctx.fillStyle = '#94a3b8';
+              ctx.font = '10px sans-serif';
+              ctx.fillText(`${i}m`, xPos - 8, groundY + 18);
+            }
+
+            // 2. Ghost (基準球軌跡)
+            if (ghostPath) {
+              ctx.setLineDash([5, 8]);
+              ctx.beginPath();
+              ghostPath.flightPoints.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+              ctx.strokeStyle = 'rgba(148, 163, 184, 0.4)';
+              ctx.stroke();
+              ctx.setLineDash([]);
+              ctx.beginPath();
+              ctx.arc(ghostPath.finalX, groundY - 4, 6, 0, Math.PI*2);
+              ctx.fillStyle = 'rgba(148, 163, 184, 0.15)';
+              ctx.fill();
+            }
+
+            // 3. 預覽與控制
+            if (!isAnimating) {
+              ctx.beginPath();
+              currentResult.flightPoints.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+              ctx.strokeStyle = 'rgba(59, 130, 246, 0.2)';
+              ctx.setLineDash([2, 2]);
+              ctx.stroke();
+              ctx.setLineDash([]);
+
+              // 高度標註線
+              ctx.beginPath();
+              ctx.setLineDash([3, 3]);
+              ctx.moveTo(currentResult.apexX, currentResult.apexY);
+              ctx.lineTo(currentResult.apexX, groundY);
+              ctx.strokeStyle = '#3b82f6';
+              ctx.stroke();
+              ctx.setLineDash([]);
+              ctx.fillStyle = '#3b82f6';
+              ctx.font = 'bold 12px monospace';
+              ctx.fillText(`${((groundY - currentResult.apexY)/scale).toFixed(2)}m`, currentResult.apexX + 8, (currentResult.apexY + groundY)/2);
+
+              // 控制藍點 (Apex)
+              ctx.beginPath();
+              ctx.arc(currentResult.apexX, currentResult.apexY, 12, 0, Math.PI * 2);
+              ctx.fillStyle = '#3b82f6';
+              ctx.fill();
+              ctx.strokeStyle = 'white';
+              ctx.lineWidth = 3;
+              ctx.stroke();
+
+              // 控制紅點 (Landing)
+              ctx.beginPath();
+              ctx.arc(currentResult.landingX, groundY, 12, 0, Math.PI * 2);
+              ctx.fillStyle = '#ef4444';
+              ctx.fill();
+              ctx.strokeStyle = 'white';
+              ctx.stroke();
+
+              // 落點數據標註
+              ctx.fillStyle = '#b91c1c';
+              ctx.font = 'bold 11px sans-serif';
+              ctx.fillText("落地點", currentResult.landingX - 15, groundY + 28);
+              ctx.fillText(`▶ 落點距離: ${((currentResult.landingX - startX)/scale).toFixed(2)}m`, currentResult.landingX - 35, groundY + 45);
+            }
+
+            // 4. 動態球體
+            const displayBall = isAnimating ? ballState : { x: currentResult.finalX, y: groundY - 5 };
+            
+            // 飛行尾跡
+            if (isAnimating && trail.length > 1) {
+              ctx.beginPath();
+              ctx.moveTo(trail[0].x, trail[0].y);
+              trail.forEach(p => ctx.lineTo(p.x, p.y));
+              ctx.strokeStyle = 'rgba(59, 130, 246, 0.4)';
+              ctx.lineWidth = 4;
+              ctx.stroke();
+            }
+
+            // 球體本體
+            const grad = ctx.createRadialGradient(displayBall.x - 3, displayBall.y - 3, 1, displayBall.x, displayBall.y, 8);
+            grad.addColorStop(0, '#f8fafc');
+            grad.addColorStop(1, '#334155');
+            ctx.beginPath();
+            ctx.arc(displayBall.x, displayBall.y, 8, 0, Math.PI * 2);
+            ctx.fillStyle = grad;
+            ctx.fill();
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+
+            // 終點提示
+            if (!isAnimating) {
+               ctx.fillStyle = '#1e293b';
+               ctx.font = 'bold 10px sans-serif';
+               ctx.fillText("靜止預測點", currentResult.finalX - 25, groundY - 25);
+               ctx.fillText(`${((currentResult.finalX - startX)/scale).toFixed(2)}m`, currentResult.finalX - 12, groundY - 14);
+            }
+
+          }, [ghostPath, currentResult, ballState, isAnimating, trail, scale, angle]);
+
+          return (
+            <div className="flex flex-col items-center p-4 bg-slate-100 min-h-screen font-sans text-slate-900 select-none">
+              <div className="w-full max-w-5xl bg-white rounded-3xl shadow-2xl overflow-hidden">
+                
+                {/* Header Section */}
+                <div className="p-6 bg-slate-900 text-white flex flex-col md:flex-row justify-between items-center">
+                  <div className="mb-4 md:mb-0">
+                    <h1 className="text-2xl font-black italic tracking-tighter text-blue-500">PETANQUE <span className="text-white">PHYSICS</span></h1>
+                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">高精度拋物線與滾動模擬器</p>
+                  </div>
+
+                  <div className="flex gap-6 items-center flex-wrap justify-center">
+                    <div className="text-center">
+                      <div className="text-[10px] text-blue-400 font-bold uppercase">仰角 (Angle)</div>
+                      <div className="text-2xl font-mono font-black">{angle.toFixed(1)}°</div>
+                    </div>
+                    <div className="text-center">
+                      <div className="text-[10px] text-emerald-400 font-bold uppercase">力道 (Power)</div>
+                      <div className="text-2xl font-mono font-black">{power.toFixed(1)}<span className="text-sm ml-1 text-emerald-200">%</span></div>
+                    </div>
+                    <div className="text-center bg-white/10 px-3 py-1 rounded-lg">
+                      <div className="text-[10px] text-purple-400 font-bold uppercase">後旋 (Spin)</div>
+                      <div className="text-2xl font-mono font-black">{spin}</div>
+                    </div>
+                    <button 
+                      disabled={isAnimating}
+                      onClick={() => setIsAnimating(true)}
+                      className="bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 text-white px-8 py-3 rounded-2xl font-black shadow-lg transition-all active:scale-95"
+                    >
+                      {isAnimating ? "模擬中..." : "開始投擲 🚀"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="p-6">
+                  <div className="relative bg-slate-50 border-2 border-slate-100 rounded-2xl overflow-hidden mb-6">
+                    <canvas 
+                      ref={canvasRef} 
+                      width={900} 
+                      height={420} 
+                      style={{ cursor: canvasCursor }}
+                      className="w-full h-auto"
+                      onMouseDown={handleStart}
+                      onMouseMove={handleMove}
+                      onMouseUp={handleEnd}
+                      onMouseLeave={handleEnd}
+                      onTouchStart={handleStart}
+                      onTouchMove={handleMove}
+                      onTouchEnd={handleEnd}
+                    />
+                    
+                    {!isAnimating && (
+                      <div className="absolute top-4 right-4 flex flex-col gap-2">
+                        <div className="bg-white/90 backdrop-blur p-4 rounded-xl shadow-sm border border-slate-200 w-48">
+                          {/* 距離數據 */}
+                          <div className="text-[10px] font-black text-slate-400 uppercase mb-2 border-b border-slate-100 pb-1">物理分析數據</div>
+                          <div className="space-y-1 mb-3">
+                            <p className="text-xs font-bold flex justify-between gap-4"><span>落點距離：</span><span className="text-blue-600">{((currentResult.landingX - startX)/scale).toFixed(2)}m</span></p>
+                            <p className="text-xs font-bold flex justify-between gap-4"><span>靜止位置：</span><span className="text-emerald-600">{((currentResult.finalX - startX)/scale).toFixed(2)}m</span></p>
+                          </div>
+                          
+                          {/* 速度向量數據 */}
+                          <div className="text-[10px] font-black text-slate-400 uppercase mb-2 border-b border-slate-100 pb-1">速度向量 (m/s)</div>
+                          <div className="space-y-1">
+                            <p className="text-[11px] font-bold flex justify-between text-slate-600"><span>總初速 (V0)：</span><span>{currentResult.v0.toFixed(2)}</span></p>
+                            <p className="text-[11px] font-bold flex justify-between text-slate-600"><span>水平分速 (Vx)：</span><span className="text-blue-500">{Math.abs(currentResult.vx0).toFixed(2)}</span></p>
+                            <p className="text-[11px] font-bold flex justify-between text-slate-600"><span>垂直分速 (Vy)：</span><span className="text-red-500">{Math.abs(currentResult.vy0).toFixed(2)}</span></p>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-4">
+                    <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200 lg:col-span-1">
+                      <div className="text-[10px] font-black text-slate-400 mb-2 uppercase flex justify-between">
+                        <span>仰角微調</span> <span className="text-blue-600">{angle.toFixed(1)}°</span>
+                      </div>
+                      <input type="range" min="15" max="85" step="0.1" value={angle} onChange={(e)=>setAngle(parseFloat(e.target.value))} className="w-full accent-blue-600"/>
+                    </div>
+                    
+                    <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200 lg:col-span-1">
+                      <div className="text-[10px] font-black text-slate-400 mb-2 uppercase flex justify-between">
+                        <span>力道微調</span> <span className="text-emerald-600">{power.toFixed(1)} %</span>
+                      </div>
+                      <input type="range" min="5" max="100" step="0.1" value={power} onChange={(e)=>setPower(parseFloat(e.target.value))} className="w-full accent-emerald-600"/>
+                      <div className="text-[9px] text-slate-400 mt-1 text-right font-medium">換算初速: {currentResult.v0.toFixed(2)} m/s</div>
+                    </div>
+
+                    <div className="bg-purple-50 p-4 rounded-2xl border border-purple-200 lg:col-span-1">
+                      <div className="text-[10px] font-black text-purple-700 mb-2 uppercase flex justify-between">
+                        <span>後旋轉 (Backspin)</span> <span>{spin} RPM</span>
+                      </div>
+                      <input type="range" min="400" max="1200" step="50" value={spin} onChange={(e)=>setSpin(parseInt(e.target.value))} className="w-full accent-purple-600"/>
+                      <div className="flex justify-between text-[9px] text-purple-500 mt-1 font-bold">
+                        <span>400 (一般)</span><span>1200 (強烈煞車)</span>
+                      </div>
+                    </div>
+
+                    <button onClick={() => setGhostPath(currentResult)} className="bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-2xl font-bold py-4 transition-all">
+                      📌 設為基準軌跡 (Ghost)
+                    </button>
+                    <button onClick={() => {setGhostPath(null); setAngle(45); setPower(45); setSpin(400);}} className="bg-white border-2 border-slate-100 text-slate-400 rounded-2xl font-bold py-4 transition-all">
+                      🔄 清空重置
+                    </button>
+                  </div>
+
+                  <div className="mt-6 p-5 bg-indigo-50 rounded-2xl border border-indigo-100 flex items-start gap-4 shadow-inner">
+                    <span className="text-2xl">💡</span>
+                    <div className="text-xs text-indigo-800 leading-relaxed">
+                      <strong>物理觀念解析：</strong><br/>
+                      1. <strong>速度向量</strong>：當你調高仰角時，為了維持相同的落點距離（Vx），你必須付出更多的總初速（V0）與垂直速度（Vy）。這解釋了為什麼「高拋球」更費力。<br/>
+                      2. <strong>真實的後旋轉 (Backspin)</strong>：後旋轉不再是改變場地的摩擦力，而是模擬落地瞬間的「咬地抵銷」。你可以嘗試：在低仰角 (20°) 加滿旋轉，滾動距離影響極小；但在高仰角 (60°) 加滿旋轉，強大的垂直撞擊力會讓旋轉狠狠咬住地面，瞬間吃掉滾動距離！
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
